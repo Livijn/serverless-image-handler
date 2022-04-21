@@ -4,9 +4,18 @@
 import S3 from 'aws-sdk/clients/s3';
 import { createHmac } from 'crypto';
 
-import { DefaultImageRequest, ImageEdits, ImageFormatTypes, ImageHandlerError, ImageHandlerEvent, ImageRequestInfo, Headers, RequestTypes, StatusCodes } from './lib';
+import {
+  DefaultImageRequest,
+  Headers,
+  ImageEdits,
+  ImageFormatTypes,
+  ImageHandlerError,
+  ImageHandlerEvent,
+  ImageRequestInfo,
+  RequestTypes,
+  StatusCodes
+} from './lib';
 import { SecretProvider } from './secret-provider';
-import { ThumborMapper } from './thumbor-mapper';
 
 type OriginalImageInfo = Partial<{
   contentType: string;
@@ -15,6 +24,10 @@ type OriginalImageInfo = Partial<{
   cacheControl: string;
   originalImage: Buffer;
 }>;
+
+const BUCKET = 'getdogsapp';
+const SIZES = {small: 64, medium: 400, large: 1000, placeholder: 300};
+const QUALITIES = {small: 75, medium: 85, large: 100, placeholder: 40};
 
 export class ImageRequest {
   private static readonly DEFAULT_REDUCTION_EFFORT = 4;
@@ -149,39 +162,8 @@ export class ImageRequest {
    * @returns The name of the appropriate Amazon S3 bucket.
    */
   public parseImageBucket(event: ImageHandlerEvent, requestType: RequestTypes): string {
-    if (requestType === RequestTypes.DEFAULT) {
-      // Decode the image request
-      const request = this.decodeRequest(event);
-
-      if (request.bucket !== undefined) {
-        // Check the provided bucket against the allowed list
-        const sourceBuckets = this.getAllowedSourceBuckets();
-
-        if (sourceBuckets.includes(request.bucket) || request.bucket.match(new RegExp('^' + sourceBuckets[0] + '$'))) {
-          return request.bucket;
-        } else {
-          throw new ImageHandlerError(
-            StatusCodes.FORBIDDEN,
-            'ImageBucket::CannotAccessBucket',
-            'The bucket you specified could not be accessed. Please check that the bucket is specified in your SOURCE_BUCKETS.'
-          );
-        }
-      } else {
-        // Try to use the default image source bucket env var
-        const sourceBuckets = this.getAllowedSourceBuckets();
-        return sourceBuckets[0];
-      }
-    } else if (requestType === RequestTypes.THUMBOR || requestType === RequestTypes.CUSTOM) {
-      // Use the default image source bucket env var
-      const sourceBuckets = this.getAllowedSourceBuckets();
-      return sourceBuckets[0];
-    } else {
-      throw new ImageHandlerError(
-        StatusCodes.NOT_FOUND,
-        'ImageBucket::CannotFindBucket',
-        'The bucket you specified could not be found. Please check the spelling of the bucket name in your request.'
-      );
-    }
+    const decoded = this.decodeRequest(event);
+    return decoded.bucket;
   }
 
   /**
@@ -191,23 +173,8 @@ export class ImageRequest {
    * @returns The edits to be made to the original image.
    */
   public parseImageEdits(event: ImageHandlerEvent, requestType: RequestTypes): ImageEdits {
-    if (requestType === RequestTypes.DEFAULT) {
-      const decoded = this.decodeRequest(event);
-      return decoded.edits;
-    } else if (requestType === RequestTypes.THUMBOR) {
-      const thumborMapping = new ThumborMapper();
-      return thumborMapping.mapPathToEdits(event.path);
-    } else if (requestType === RequestTypes.CUSTOM) {
-      const thumborMapping = new ThumborMapper();
-      const parsedPath = thumborMapping.parseCustomPath(event.path);
-      return thumborMapping.mapPathToEdits(parsedPath);
-    } else {
-      throw new ImageHandlerError(
-        StatusCodes.BAD_REQUEST,
-        'ImageEdits::CannotParseEdits',
-        'The edits you provided could not be parsed. Please check the syntax of your request and refer to the documentation for additional guidance.'
-      );
-    }
+    const decoded = this.decodeRequest(event);
+    return decoded.edits;
   }
 
   /**
@@ -217,39 +184,8 @@ export class ImageRequest {
    * @returns The name of the appropriate Amazon S3 key.
    */
   public parseImageKey(event: ImageHandlerEvent, requestType: RequestTypes): string {
-    if (requestType === RequestTypes.DEFAULT) {
-      // Decode the image request and return the image key
-      const { key } = this.decodeRequest(event);
-      return key;
-    }
-
-    if (requestType === RequestTypes.THUMBOR || requestType === RequestTypes.CUSTOM) {
-      let { path } = event;
-
-      if (requestType === RequestTypes.CUSTOM) {
-        const { REWRITE_MATCH_PATTERN, REWRITE_SUBSTITUTION } = process.env;
-
-        if (typeof REWRITE_MATCH_PATTERN === 'string') {
-          const patternStrings = REWRITE_MATCH_PATTERN.split('/');
-          const flags = patternStrings.pop();
-          const parsedPatternString = REWRITE_MATCH_PATTERN.slice(1, REWRITE_MATCH_PATTERN.length - 1 - flags.length);
-          const regExp = new RegExp(parsedPatternString, flags);
-
-          path = path.replace(regExp, REWRITE_SUBSTITUTION);
-        } else {
-          path = path.replace(REWRITE_MATCH_PATTERN, REWRITE_SUBSTITUTION);
-        }
-      }
-
-      return decodeURIComponent(path.replace(/\/\d+x\d+:\d+x\d+\/|(?<=\/)\d+x\d+\/|filters:[^/]+|\/fit-in(?=\/)|^\/+/g, '').replace(/^\/+/, ''));
-    }
-
-    // Return an error for all other conditions
-    throw new ImageHandlerError(
-      StatusCodes.NOT_FOUND,
-      'ImageEdits::CannotFindImage',
-      'The image you specified could not be found. Please check your request syntax as well as the bucket you specified to ensure it exists.'
-    );
+    const decoded = this.decodeRequest(event);
+    return decoded.key;
   }
 
   /**
@@ -259,37 +195,7 @@ export class ImageRequest {
    * @returns The request type.
    */
   public parseRequestType(event: ImageHandlerEvent): RequestTypes {
-    const { path } = event;
-    const matchDefault = /^(\/?)([0-9a-zA-Z+/]{4})*(([0-9a-zA-Z+/]{2}==)|([0-9a-zA-Z+/]{3}=))?$/;
-    const matchThumbor = /^(\/?)((fit-in)?|(filters:.+\(.?\))?|(unsafe)?)(((.(?!(\.[^.\\/]+$)))*$)|.*(\.jpg$|.\.png$|\.webp$|\.tiff$|\.jpeg$|\.svg$))/i;
-    const { REWRITE_MATCH_PATTERN, REWRITE_SUBSTITUTION } = process.env;
-    const definedEnvironmentVariables = REWRITE_MATCH_PATTERN !== '' && REWRITE_SUBSTITUTION !== '' && REWRITE_MATCH_PATTERN !== undefined && REWRITE_SUBSTITUTION !== undefined;
-
-    // Check if path is base 64 encoded
-    let isBase64Encoded = true;
-    try {
-      this.decodeRequest(event);
-    } catch (error) {
-      console.error(error);
-      isBase64Encoded = false;
-    }
-
-    if (matchDefault.test(path) && isBase64Encoded) {
-      // use sharp
-      return RequestTypes.DEFAULT;
-    } else if (definedEnvironmentVariables) {
-      // use rewrite function then thumbor mappings
-      return RequestTypes.CUSTOM;
-    } else if (matchThumbor.test(path)) {
-      // use thumbor mappings
-      return RequestTypes.THUMBOR;
-    } else {
-      throw new ImageHandlerError(
-        StatusCodes.BAD_REQUEST,
-        'RequestTypeError',
-        'The type of request you are making could not be processed. Please ensure that your original image is of a supported file type (jpg, png, tiff, webp, svg) and that your image request is provided in the correct syntax. Refer to the documentation for additional guidance on forming image requests.'
-      );
-    }
+    return RequestTypes.DEFAULT;
   }
 
   /**
@@ -314,28 +220,31 @@ export class ImageRequest {
    * @returns The decoded from base-64 image request.
    */
   public decodeRequest(event: ImageHandlerEvent): DefaultImageRequest {
-    const { path } = event;
+    const [, id, size] = event.path.split('/');
 
-    if (path) {
-      const encoded = path.charAt(0) === '/' ? path.slice(1) : path;
-      const toBuffer = Buffer.from(encoded, 'base64');
-      try {
-        // To support European characters, 'ascii' was removed.
-        return JSON.parse(toBuffer.toString());
-      } catch (error) {
-        throw new ImageHandlerError(
-          StatusCodes.BAD_REQUEST,
-          'DecodeRequest::CannotDecodeRequest',
-          'The image request you provided could not be decoded. Please check that your request is base64 encoded properly and refer to the documentation for additional guidance.'
-        );
-      }
-    } else {
-      throw new ImageHandlerError(
-        StatusCodes.BAD_REQUEST,
-        'DecodeRequest::CannotReadPath',
-        'The URL path you provided could not be read. Please ensure that it is properly formed according to the solution documentation.'
-      );
+    let edits = {
+      webp: {
+        quality: QUALITIES[size],
+      },
+      jpeg: {
+        quality: QUALITIES[size],
+      },
+      resize: {
+        width: SIZES[size],
+        height: SIZES[size],
+        fit: "inside"
+      },
+    };
+
+    if (size === 'placeholder') {
+      edits['blur'] = 30;
     }
+
+    return {
+      bucket: BUCKET,
+      key: `content/${id}`,
+      edits,
+    };
   }
 
   /**
